@@ -725,6 +725,7 @@ You can switch between providers at any time with `hermes model` — no restart 
 | Feature | Provider | Env Variable |
 |---------|----------|--------------|
 | Web scraping | [Firecrawl](https://firecrawl.dev/) | `FIRECRAWL_API_KEY`, `FIRECRAWL_API_URL` |
+| Web scraping | [Bright Data](https://brightdata.com/) | `BRIGHTDATA_API_KEY` |
 | Browser automation | [Browserbase](https://browserbase.com/) | `BROWSERBASE_API_KEY`, `BROWSERBASE_PROJECT_ID` |
 | Image generation | [FAL](https://fal.ai/) | `FAL_KEY` |
 | Premium TTS voices | [ElevenLabs](https://elevenlabs.io/) | `ELEVENLABS_API_KEY` |
@@ -756,6 +757,31 @@ By default, Hermes uses the [Firecrawl cloud API](https://firecrawl.dev/) for we
    ```
 
 You can also set both `FIRECRAWL_API_KEY` and `FIRECRAWL_API_URL` if your self-hosted instance has authentication enabled.
+
+### Bright Data
+
+[Bright Data](https://brightdata.com/) provides web search and scraping via its Web Unlocker API. It offers a free tier and handles anti-bot bypassing, CAPTCHAs, and IP rotation out of the box.
+
+**Setup:**
+
+1. Get your API key from the [Bright Data control panel](https://brightdata.com/cp/setting/users).
+
+2. Run the setup wizard:
+   ```bash
+   hermes tools
+   ```
+   Select **Bright Data** as the web search provider and paste your API key. A `cli_unlocker` zone is automatically provisioned on your account.
+
+   Or configure manually:
+   ```bash
+   hermes config set BRIGHTDATA_API_KEY your-key-here
+   hermes config set web.backend brightdata
+   ```
+
+3. (Optional) Override the default zone name:
+   ```bash
+   hermes config set BRIGHTDATA_UNLOCKER_ZONE my_custom_zone
+   ```
 
 ## OpenRouter Provider Routing
 
