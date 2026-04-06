@@ -13,6 +13,7 @@ Available tools:
 - web_crawl_tool: Crawl websites with specific instructions
 
 Backend compatibility:
+- Bright Data: https://brightdata.com (search, extract — free tier available)
 - Exa: https://exa.ai (search, extract)
 - Firecrawl: https://docs.firecrawl.dev/introduction (search, extract, crawl; direct or derived firecrawl-gateway.<domain> for Nous Subscribers)
 - Parallel: https://docs.parallel.ai (search, extract)
@@ -88,7 +89,7 @@ def _get_backend() -> str:
     keys manually without running setup.
     """
     configured = (_load_web_config().get("backend") or "").lower().strip()
-    if configured in ("parallel", "firecrawl", "tavily", "exa"):
+    if configured in ("parallel", "firecrawl", "tavily", "exa", "brightdata"):
         return configured
 
     # Fallback for manual / legacy config — pick the highest-priority
@@ -96,6 +97,7 @@ def _get_backend() -> str:
     # tool gateway is configured for Nous subscribers.
     backend_candidates = (
         ("firecrawl", _has_env("FIRECRAWL_API_KEY") or _has_env("FIRECRAWL_API_URL") or _is_tool_gateway_ready()),
+        ("brightdata", _has_env("BRIGHTDATA_API_KEY")),
         ("parallel", _has_env("PARALLEL_API_KEY")),
         ("tavily", _has_env("TAVILY_API_KEY")),
         ("exa", _has_env("EXA_API_KEY")),
@@ -109,6 +111,8 @@ def _get_backend() -> str:
 
 def _is_backend_available(backend: str) -> bool:
     """Return True when the selected backend is currently usable."""
+    if backend == "brightdata":
+        return _has_env("BRIGHTDATA_API_KEY")
     if backend == "exa":
         return _has_env("EXA_API_KEY")
     if backend == "parallel":
@@ -184,6 +188,7 @@ def _firecrawl_backend_help_suffix() -> str:
 def _web_requires_env() -> list[str]:
     """Return tool metadata env vars for the currently enabled web backends."""
     requires = [
+        "BRIGHTDATA_API_KEY",
         "EXA_API_KEY",
         "PARALLEL_API_KEY",
         "TAVILY_API_KEY",
@@ -359,6 +364,170 @@ def _normalize_tavily_documents(response: dict, fallback_url: str = "") -> List[
             "metadata": {"sourceURL": url_str},
         })
     return documents
+
+
+# ─── Bright Data Client ─────────────────────────────────────────────────────
+
+_BRIGHTDATA_BASE_URL = "https://api.brightdata.com"
+_BRIGHTDATA_RETRY_STATUSES = (429, 500, 502, 503, 504)
+_BRIGHTDATA_MAX_RETRIES = 3
+_BRIGHTDATA_RETRY_BASE_MS = 500
+
+
+def _get_brightdata_api_key() -> str:
+    """Return the Bright Data API key or raise with setup instructions."""
+    api_key = os.getenv("BRIGHTDATA_API_KEY", "").strip()
+    if not api_key:
+        raise ValueError(
+            "BRIGHTDATA_API_KEY environment variable not set. "
+            "Get your API key at https://brightdata.com/cp/setting/users"
+        )
+    return api_key
+
+
+def _get_brightdata_zone() -> str:
+    """Resolve the Bright Data zone name.
+
+    Priority: BRIGHTDATA_UNLOCKER_ZONE env → web.brightdata_zone config → default.
+    """
+    env_zone = os.getenv("BRIGHTDATA_UNLOCKER_ZONE", "").strip()
+    if env_zone:
+        return env_zone
+    config_zone = _load_web_config().get("brightdata_zone", "").strip()
+    if config_zone:
+        return config_zone
+    return "cli_unlocker"
+
+
+def _brightdata_request(payload: dict, *, timeout: int = 60) -> Any:
+    """Send a POST to ``/request`` on the Bright Data API with retry logic.
+
+    Uses Bearer token auth. Retries on transient HTTP errors with
+    exponential backoff (matches the Bright Data CLI convention).
+    """
+    api_key = _get_brightdata_api_key()
+    url = f"{_BRIGHTDATA_BASE_URL}/request"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "User-Agent": "hermes-agent",
+    }
+
+    last_error: Optional[Exception] = None
+    for attempt in range(_BRIGHTDATA_MAX_RETRIES + 1):
+        try:
+            response = httpx.post(url, json=payload, headers=headers, timeout=timeout)
+            if response.status_code in _BRIGHTDATA_RETRY_STATUSES and attempt < _BRIGHTDATA_MAX_RETRIES:
+                import time
+                time.sleep(_BRIGHTDATA_RETRY_BASE_MS / 1000 * (2 ** attempt))
+                continue
+            response.raise_for_status()
+            content_type = response.headers.get("content-type", "")
+            if "application/json" in content_type:
+                return response.json()
+            return response.text
+        except httpx.HTTPStatusError as exc:
+            brd_error = exc.response.headers.get("x-brd-error") or exc.response.headers.get("x-luminati-error")
+            if brd_error:
+                raise ValueError(f"Bright Data API error: {brd_error}") from exc
+            raise
+        except (httpx.ConnectError, httpx.ReadTimeout) as exc:
+            last_error = exc
+            if attempt < _BRIGHTDATA_MAX_RETRIES:
+                import time
+                time.sleep(_BRIGHTDATA_RETRY_BASE_MS / 1000 * (2 ** attempt))
+                continue
+    raise last_error or RuntimeError("Bright Data request failed after retries")
+
+
+def _brightdata_search(query: str, limit: int = 5) -> dict:
+    """Search using the Bright Data SERP API and return normalised results.
+
+    Scrapes a Google search URL via the ``/request`` endpoint with
+    ``brd_json=1`` to get parsed structured results, then maps them to the
+    standard ``{success, data: {web: [...]}}`` format.
+    """
+    from tools.interrupt import is_interrupted
+    if is_interrupted():
+        return {"error": "Interrupted", "success": False}
+
+    zone = _get_brightdata_zone()
+    search_url = f"https://www.google.com/search?q={query}&brd_json=1&num={limit}"
+    logger.info("Bright Data search: '%s' (zone=%s, limit=%d)", query, zone, limit)
+
+    raw = _brightdata_request({
+        "zone": zone,
+        "url": search_url,
+        "format": "raw",
+    })
+
+    # Parse the structured Google SERP response
+    web_results = []
+    if isinstance(raw, dict):
+        for i, result in enumerate(raw.get("organic", [])):
+            web_results.append({
+                "title": result.get("title", ""),
+                "url": result.get("link", ""),
+                "description": result.get("description", ""),
+                "position": result.get("rank", i + 1),
+            })
+    elif isinstance(raw, str):
+        # Fallback: response came back as text (non-JSON Google page).
+        # Wrap as a single result so callers still get something useful.
+        logger.warning("Bright Data search returned text instead of parsed JSON")
+        web_results.append({
+            "title": f"Search results for: {query}",
+            "url": f"https://www.google.com/search?q={query}",
+            "description": raw[:500],
+            "position": 1,
+        })
+
+    return {"success": True, "data": {"web": web_results[:limit]}}
+
+
+def _brightdata_extract(urls: List[str]) -> List[Dict[str, Any]]:
+    """Extract content from URLs using Bright Data Web Unlocker.
+
+    Each URL is scraped with ``data_format: markdown`` and returned in the
+    standard document format expected by the LLM post-processing pipeline.
+    """
+    from tools.interrupt import is_interrupted
+    if is_interrupted():
+        return [{"url": u, "error": "Interrupted", "title": ""} for u in urls]
+
+    zone = _get_brightdata_zone()
+    logger.info("Bright Data extract: %d URL(s) (zone=%s)", len(urls), zone)
+
+    results: List[Dict[str, Any]] = []
+    for url in urls:
+        if is_interrupted():
+            results.append({"url": url, "error": "Interrupted", "title": ""})
+            continue
+        try:
+            content = _brightdata_request({
+                "zone": zone,
+                "url": url,
+                "format": "raw",
+                "data_format": "markdown",
+            })
+            text = content if isinstance(content, str) else json.dumps(content)
+            results.append({
+                "url": url,
+                "title": "",
+                "content": text,
+                "raw_content": text,
+                "metadata": {"sourceURL": url},
+            })
+        except Exception as exc:
+            logger.debug("Bright Data extract failed for %s: %s", url, exc)
+            results.append({
+                "url": url,
+                "title": "",
+                "content": "",
+                "raw_content": "",
+                "error": str(exc),
+            })
+    return results
 
 
 def _to_plain_object(value: Any) -> Any:
@@ -1083,6 +1252,15 @@ def web_search_tool(query: str, limit: int = 5) -> str:
 
         # Dispatch to the configured backend
         backend = _get_backend()
+        if backend == "brightdata":
+            response_data = _brightdata_search(query, limit)
+            debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
+            result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
+            debug_call_data["final_response_size"] = len(result_json)
+            _debug.log_call("web_search_tool", debug_call_data)
+            _debug.save()
+            return result_json
+
         if backend == "parallel":
             response_data = _parallel_search(query, limit)
             debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
@@ -1238,7 +1416,9 @@ async def web_extract_tool(
         else:
             backend = _get_backend()
 
-            if backend == "parallel":
+            if backend == "brightdata":
+                results = _brightdata_extract(safe_urls)
+            elif backend == "parallel":
                 results = await _parallel_extract(safe_urls)
             elif backend == "exa":
                 results = _exa_extract(safe_urls)
@@ -1539,6 +1719,76 @@ async def web_crawl_tool(
         effective_model = model or _get_default_summarizer_model()
         auxiliary_available = check_auxiliary_model()
         backend = _get_backend()
+
+        # Bright Data supports crawl via its /request endpoint (single-page scrape)
+        if backend == "brightdata":
+            if not url.startswith(('http://', 'https://')):
+                url = f'https://{url}'
+
+            if not is_safe_url(url):
+                return json.dumps({"results": [{"url": url, "title": "", "content": "",
+                    "error": "Blocked: URL targets a private or internal network address"}]}, ensure_ascii=False)
+
+            blocked = check_website_access(url)
+            if blocked:
+                logger.info("Blocked web_crawl for %s by rule %s", blocked["host"], blocked["rule"])
+                return json.dumps({"results": [{"url": url, "title": "", "content": "", "error": blocked["message"],
+                    "blocked_by_policy": {"host": blocked["host"], "rule": blocked["rule"], "source": blocked["source"]}}]}, ensure_ascii=False)
+
+            from tools.interrupt import is_interrupted as _is_int
+            if _is_int():
+                return json.dumps({"error": "Interrupted", "success": False})
+
+            logger.info("Bright Data crawl (single-page scrape): %s", url)
+            results = _brightdata_extract([url])
+            response = {"results": results}
+
+            pages_crawled = len(response.get('results', []))
+            logger.info("Crawled %d pages", pages_crawled)
+            debug_call_data["pages_crawled"] = pages_crawled
+            debug_call_data["original_response_size"] = len(json.dumps(response))
+
+            if use_llm_processing and auxiliary_available:
+                logger.info("Processing crawled content with LLM (parallel)...")
+                debug_call_data["processing_applied"].append("llm_processing")
+
+                async def _process_bd_crawl(result):
+                    page_url = result.get('url', 'Unknown URL')
+                    page_title = result.get('title', '')
+                    content = result.get('content', '')
+                    if not content:
+                        return result, None, "no_content"
+                    original_size = len(content)
+                    processed = await process_content_with_llm(content, page_url, page_title, effective_model, min_length)
+                    if processed:
+                        result['raw_content'] = content
+                        result['content'] = processed
+                        metrics = {"url": page_url, "original_size": original_size, "processed_size": len(processed),
+                                   "compression_ratio": len(processed) / original_size if original_size else 1.0, "model_used": effective_model}
+                        return result, metrics, "processed"
+                    metrics = {"url": page_url, "original_size": original_size, "processed_size": original_size,
+                               "compression_ratio": 1.0, "model_used": None, "reason": "content_too_short"}
+                    return result, metrics, "too_short"
+
+                tasks = [_process_bd_crawl(r) for r in response.get('results', [])]
+                processed_results = await asyncio.gather(*tasks)
+                for result, metrics, status in processed_results:
+                    if status == "processed":
+                        debug_call_data["compression_metrics"].append(metrics)
+                        debug_call_data["pages_processed_with_llm"] += 1
+
+            if use_llm_processing and not auxiliary_available:
+                logger.warning("LLM processing requested but no auxiliary model available, returning raw content")
+                debug_call_data["processing_applied"].append("llm_processing_unavailable")
+
+            trimmed_results = [{"url": r.get("url", ""), "title": r.get("title", ""), "content": r.get("content", ""), "error": r.get("error"),
+                **({  "blocked_by_policy": r["blocked_by_policy"]} if "blocked_by_policy" in r else {})} for r in response.get("results", [])]
+            result_json = json.dumps({"results": trimmed_results}, indent=2, ensure_ascii=False)
+            cleaned_result = clean_base64_images(result_json)
+            debug_call_data["final_response_size"] = len(cleaned_result)
+            _debug.log_call("web_crawl_tool", debug_call_data)
+            _debug.save()
+            return cleaned_result
 
         # Tavily supports crawl via its /crawl endpoint
         if backend == "tavily":
@@ -1919,9 +2169,9 @@ def check_firecrawl_api_key() -> bool:
 def check_web_api_key() -> bool:
     """Check whether the configured web backend is available."""
     configured = _load_web_config().get("backend", "").lower().strip()
-    if configured in ("exa", "parallel", "firecrawl", "tavily"):
+    if configured in ("brightdata", "exa", "parallel", "firecrawl", "tavily"):
         return _is_backend_available(configured)
-    return any(_is_backend_available(backend) for backend in ("exa", "parallel", "firecrawl", "tavily"))
+    return any(_is_backend_available(backend) for backend in ("brightdata", "exa", "parallel", "firecrawl", "tavily"))
 
 
 def check_auxiliary_model() -> bool:
@@ -1953,7 +2203,9 @@ if __name__ == "__main__":
     if web_available:
         backend = _get_backend()
         print(f"✅ Web backend: {backend}")
-        if backend == "exa":
+        if backend == "brightdata":
+            print(f"   Using Bright Data API (zone={_get_brightdata_zone()})")
+        elif backend == "exa":
             print("   Using Exa API (https://exa.ai)")
         elif backend == "parallel":
             print("   Using Parallel API (https://parallel.ai)")
@@ -1971,7 +2223,7 @@ if __name__ == "__main__":
     else:
         print("❌ No web search backend configured")
         print(
-            "Set EXA_API_KEY, PARALLEL_API_KEY, TAVILY_API_KEY, FIRECRAWL_API_KEY, FIRECRAWL_API_URL"
+            "Set BRIGHTDATA_API_KEY, EXA_API_KEY, PARALLEL_API_KEY, TAVILY_API_KEY, FIRECRAWL_API_KEY, FIRECRAWL_API_URL"
             f"{_firecrawl_backend_help_suffix()}"
         )
 

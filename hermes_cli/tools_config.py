@@ -245,6 +245,15 @@ TOOL_CATEGORIES = {
                 ],
             },
             {
+                "name": "Bright Data",
+                "tag": "Free tier — search, extract, and crawl with Web Unlocker",
+                "web_backend": "brightdata",
+                "env_vars": [
+                    {"key": "BRIGHTDATA_API_KEY", "prompt": "Bright Data API key", "url": "https://brightdata.com/cp/setting/users"},
+                ],
+                "post_setup": "brightdata_zones",
+            },
+            {
                 "name": "Firecrawl Self-Hosted",
                 "tag": "Free - run your own instance",
                 "web_backend": "firecrawl",
@@ -367,6 +376,91 @@ TOOLSET_ENV_REQUIREMENTS = {
 }
 
 
+# ─── Bright Data Zone Provisioning ───────────────────────────────────────────
+
+_BRIGHTDATA_UNLOCKER_ZONE = "cli_unlocker"
+
+
+def _brightdata_ensure_zones():
+    """Auto-provision a ``cli_unlocker`` zone after the API key is saved.
+
+    Mirrors the zone provisioning logic from the Bright Data CLI
+    (``login.ts → ensure_zones``).  Runs once during ``hermes tools`` setup
+    and is idempotent — skips creation if the zone already exists.
+    """
+    import httpx as _httpx
+
+    api_key = get_env_value("BRIGHTDATA_API_KEY")
+    if not api_key:
+        _print_warning("    Bright Data API key not found — skipping zone provisioning.")
+        return
+
+    base_url = "https://api.brightdata.com"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "User-Agent": "hermes-agent",
+    }
+
+    # --- validate key --------------------------------------------------------
+    _print_info("    Validating API key...")
+    try:
+        resp = _httpx.get(f"{base_url}/zone", headers=headers, timeout=15)
+        if resp.status_code in (401, 403):
+            _print_warning(
+                "    Invalid or expired API key. "
+                "Check your key at https://brightdata.com/cp/setting/users"
+            )
+            return
+    except Exception as exc:
+        _print_warning(f"    Could not validate API key — {exc}")
+        return
+
+    # --- check existing zones ------------------------------------------------
+    _print_info("    Checking for required zones...")
+    try:
+        zones_resp = _httpx.get(
+            f"{base_url}/zone/get_active_zones", headers=headers, timeout=15
+        )
+        zones_resp.raise_for_status()
+        zones = zones_resp.json()
+    except Exception as exc:
+        _print_warning(f"    Could not fetch zones — {exc}")
+        return
+
+    has_unlocker = any(z.get("name") == _BRIGHTDATA_UNLOCKER_ZONE for z in zones)
+
+    # --- create zone if missing ----------------------------------------------
+    if not has_unlocker:
+        _print_info(f'    Zone "{_BRIGHTDATA_UNLOCKER_ZONE}" not found, creating...')
+        try:
+            create_resp = _httpx.post(
+                f"{base_url}/zone",
+                headers=headers,
+                json={
+                    "zone": {"name": _BRIGHTDATA_UNLOCKER_ZONE, "type": "unblocker"},
+                    "plan": {"type": "unblocker"},
+                },
+                timeout=15,
+            )
+            create_resp.raise_for_status()
+            _print_success(f'    Zone "{_BRIGHTDATA_UNLOCKER_ZONE}" created successfully.')
+        except Exception as exc:
+            _print_warning(
+                f'    Could not create zone "{_BRIGHTDATA_UNLOCKER_ZONE}" — {exc}\n'
+                "    You can create it manually at https://brightdata.com/cp/zones"
+            )
+            return
+    else:
+        _print_success(f'    Zone "{_BRIGHTDATA_UNLOCKER_ZONE}" already exists.')
+
+    # --- persist zone as env default -----------------------------------------
+    existing_zone = get_env_value("BRIGHTDATA_UNLOCKER_ZONE")
+    if not existing_zone:
+        save_env_value("BRIGHTDATA_UNLOCKER_ZONE", _BRIGHTDATA_UNLOCKER_ZONE)
+        _print_success(f"    Default zone saved: BRIGHTDATA_UNLOCKER_ZONE={_BRIGHTDATA_UNLOCKER_ZONE}")
+
+
 # ─── Post-Setup Hooks ─────────────────────────────────────────────────────────
 
 def _run_post_setup(post_setup_key: str):
@@ -410,6 +504,9 @@ def _run_post_setup(post_setup_key: str):
         elif not shutil.which("npm"):
             _print_warning("    Node.js not found. Install Camofox via Docker:")
             _print_info("      docker run -p 9377:9377 -e CAMOFOX_PORT=9377 jo-inc/camofox-browser")
+
+    elif post_setup_key == "brightdata_zones":
+        _brightdata_ensure_zones()
 
     elif post_setup_key == "rl_training":
         try:
