@@ -444,43 +444,50 @@ def _brightdata_search(query: str, limit: int = 5) -> dict:
     """Search using the Bright Data SERP API and return normalised results.
 
     Scrapes a Google search URL via the ``/request`` endpoint with
-    ``brd_json=1`` to get parsed structured results, then maps them to the
-    standard ``{success, data: {web: [...]}}`` format.
+    ``brd_json=1`` + ``data_format: parsed_light`` to get structured JSON
+    results, then maps them to the standard format.
     """
     from tools.interrupt import is_interrupted
+    from urllib.parse import quote
     if is_interrupted():
         return {"error": "Interrupted", "success": False}
 
     zone = _get_brightdata_zone()
-    search_url = f"https://www.google.com/search?q={query}&brd_json=1&num={limit}"
+    encoded_query = quote(query)
+    search_url = f"https://www.google.com/search?q={encoded_query}&start=0&brd_json=1&num={limit}"
     logger.info("Bright Data search: '%s' (zone=%s, limit=%d)", query, zone, limit)
 
     raw = _brightdata_request({
         "zone": zone,
         "url": search_url,
         "format": "raw",
+        "data_format": "parsed_light",
     })
 
-    # Parse the structured Google SERP response
+    # The API may return text/plain with JSON content — try to parse.
+    search_data = raw
+    if isinstance(raw, str):
+        try:
+            search_data = json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            search_data = raw
+
     web_results = []
-    if isinstance(raw, dict):
-        for i, result in enumerate(raw.get("organic", [])):
+    if isinstance(search_data, dict):
+        for i, result in enumerate(search_data.get("organic", [])):
+            link = (result.get("link") or "").strip()
+            title = (result.get("title") or "").strip()
+            description = (result.get("description") or "").strip()
+            if not link or not title:
+                continue
             web_results.append({
-                "title": result.get("title", ""),
-                "url": result.get("link", ""),
-                "description": result.get("description", ""),
+                "title": title,
+                "url": link,
+                "description": description,
                 "position": result.get("rank", i + 1),
             })
-    elif isinstance(raw, str):
-        # Fallback: response came back as text (non-JSON Google page).
-        # Wrap as a single result so callers still get something useful.
-        logger.warning("Bright Data search returned text instead of parsed JSON")
-        web_results.append({
-            "title": f"Search results for: {query}",
-            "url": f"https://www.google.com/search?q={query}",
-            "description": raw[:500],
-            "position": 1,
-        })
+    else:
+        logger.warning("Bright Data search returned unparsed text")
 
     return {"success": True, "data": {"web": web_results[:limit]}}
 
