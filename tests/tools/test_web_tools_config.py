@@ -299,6 +299,7 @@ class TestBackendSelection:
 
     _ENV_KEYS = (
         "HERMES_ENABLE_NOUS_MANAGED_TOOLS",
+        "BRIGHTDATA_API_KEY",
         "EXA_API_KEY",
         "PARALLEL_API_KEY",
         "FIRECRAWL_API_KEY",
@@ -524,6 +525,7 @@ class TestCheckWebApiKey:
 
     _ENV_KEYS = (
         "HERMES_ENABLE_NOUS_MANAGED_TOOLS",
+        "BRIGHTDATA_API_KEY",
         "EXA_API_KEY",
         "PARALLEL_API_KEY",
         "FIRECRAWL_API_KEY",
@@ -610,8 +612,24 @@ class TestCheckWebApiKey:
                     from tools.web_tools import check_web_api_key
                     assert check_web_api_key() is True
 
+    def test_brightdata_key_only(self):
+        with patch.dict(os.environ, {"BRIGHTDATA_API_KEY": "bd-test"}):
+            from tools.web_tools import check_web_api_key
+            assert check_web_api_key() is True
+
+    def test_configured_brightdata_backend_requires_key(self):
+        with patch("tools.web_tools._load_web_config", return_value={"backend": "brightdata"}):
+            from tools.web_tools import check_web_api_key
+            assert check_web_api_key() is False
+
 
 def test_web_requires_env_includes_exa_key():
     from tools.web_tools import _web_requires_env
 
     assert "EXA_API_KEY" in _web_requires_env()
+
+
+def test_web_requires_env_includes_brightdata_key():
+    from tools.web_tools import _web_requires_env
+
+    assert "BRIGHTDATA_API_KEY" in _web_requires_env()
